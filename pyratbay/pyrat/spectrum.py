@@ -2,6 +2,7 @@
 # Pyrat Bay is open-source software under the GNU GPL-2.0 license (see LICENSE)
 
 import numpy as np
+from numpy.core.fromnumeric import transpose
 from scipy.interpolate import interp1d
 
 from .. import constants as pc
@@ -9,7 +10,13 @@ from .. import io as io
 from .. import spectrum as ps
 from ..lib import _trapz as t
 
+import math
+from viztracer import log_sparse, get_tracer
+import numba
+import numba.cuda as cuda
 
+
+@log_sparse
 def spectrum(pyrat):
     """
     Spectrum calculation driver.
@@ -41,6 +48,7 @@ def spectrum(pyrat):
     pyrat.log.head('Done.')
 
 
+@log_sparse
 def modulation(pyrat):
     """Calculate modulation spectrum for transit geometry."""
     rtop = pyrat.atm.rtop
@@ -88,6 +96,60 @@ def modulation(pyrat):
     pyrat.log.head(f"Computed transmission spectrum{specfile}.", indent=2)
 
 
+@cuda.jit(device=True)
+def tdiff(dtau, depth, mu, top, last, wave):
+    for i in range(0, int(last - top)):
+        val1 = math.exp(-depth[top + i + 1, wave] / mu)
+        val2 = math.exp(-depth[top + i, wave] / mu) 
+        dtau[i] =  val1 - val2
+
+
+@cuda.jit(device=True)
+def itrapz(bbody, dtau, top, last, wave_ind):
+    res = np.float32(0)
+
+    for i in range(0, int(last - top)):
+        res += dtau[i] * (bbody[top + i + 1, wave_ind] + bbody[top + i, wave_ind])
+    #print(0.5 * res)
+    return 0.5  * res
+
+
+@cuda.jit
+def t_intensity_cuda(depth, ideep, bbody, mu, rtop, return_arr):
+    tx = cuda.threadIdx.x
+    ty = cuda.blockIdx.x
+    bw = cuda.blockDim.x
+
+    wave_ind = tx + ty * bw
+    kvalue = cuda.threadIdx.y
+
+    dtau = cuda.local.array((100,), dtype=numba.types.float32)
+
+    if wave_ind < 8001 and kvalue < 5:
+
+        last = int(ideep[wave_ind])
+        tau_max = depth[last, wave_ind]
+        
+        if last - rtop == 1:
+            return_arr[kvalue, wave_ind] = bbody[last, wave_ind]
+        else:
+            # integration
+            tdiff(dtau, depth, mu[kvalue], rtop, last, wave_ind)
+            return_arr[kvalue, wave_ind] = bbody[last, wave_ind] * math.exp(-tau_max / mu[kvalue]) - itrapz(bbody, dtau, rtop, last, wave_ind)
+
+
+@log_sparse
+def t_intensity_cuda_wrapper(depth, ideep, bbody, mu, rtop):
+    alts, nwave = depth.shape
+    ntheta = len(mu)
+    #dtau = cuda.device_array((5, 8001, 100,), dtype=np.float64)
+    return_arr = cuda.device_array((5, 8001), dtype=np.float64)
+    print("cuda wrapper")
+    t_intensity_cuda[64, (128, 8)](depth.astype(np.float32), ideep.astype(np.float32), bbody.astype(np.float32), mu.astype(np.float32), rtop, return_arr)
+
+    return return_arr.copy_to_host().astype(np.float64)
+
+@log_sparse
 def intensity(pyrat):
     """
     Calculate the intensity spectrum [units] for eclipse geometry.
@@ -102,19 +164,26 @@ def intensity(pyrat):
     spec.intensity = np.empty((spec.nangles, spec.nwave), np.double)
 
     # Calculate the Planck Emission:
-    pyrat.od.B = np.zeros((pyrat.atm.nlayers, spec.nwave), np.double)
-    ps.blackbody_wn_2D(spec.wn, pyrat.atm.temp, pyrat.od.B, pyrat.od.ideep)
+    with get_tracer().log_event("planck_emission"):
+        pyrat.od.B = np.zeros((pyrat.atm.nlayers, spec.nwave), np.double)
+        ps.blackbody_wn_2D(spec.wn, pyrat.atm.temp, pyrat.od.B, pyrat.od.ideep)
 
     if 'deck' in (m.name for m in pyrat.cloud.models):
-        deck = pyrat.cloud.models[pyrat.cloud.model_names.index('deck')]
-        pyrat.od.B[deck.itop] = ps.blackbody_wn(pyrat.spec.wn, deck.tsurf)
+        with get_tracer().log_event("deck"):
+            deck = pyrat.cloud.models[pyrat.cloud.model_names.index('deck')]
+            pyrat.od.B[deck.itop] = ps.blackbody_wn(pyrat.spec.wn, deck.tsurf)
 
     # Plane-parallel radiative-transfer intensity integration:
-    spec.intensity = t.intensity(
-        pyrat.od.depth, pyrat.od.ideep, pyrat.od.B, np.cos(spec.raygrid),
-        pyrat.atm.rtop)
+    with get_tracer().log_event("t.intensity"):
+        spec.intensity = t.intensity(
+            pyrat.od.depth, pyrat.od.ideep, pyrat.od.B, np.cos(spec.raygrid),
+            pyrat.atm.rtop)
 
+        _intensity = t_intensity_cuda_wrapper(pyrat.od.depth, pyrat.od.ideep, pyrat.od.B, np.cos(spec.raygrid), pyrat.atm.rtop)
+        print(spec.intensity)
+        print(_intensity)
 
+@log_sparse
 def flux(pyrat):
     """
     Calculate the hemisphere-integrated flux spectrum [units] for eclipse
